@@ -10,4 +10,5 @@ add_executable(sdr main.cpp inc/sdrDevice.h
         inc/iio.h
         src/sdrDevice.cpp inc/log.h src/log.cpp)
 
-target_link_libraries(sdr iio ad9361 uhd pthread)
+target_link_libraries(sdr iio ad9361 uhd pthread
+        uhd boost_system boost_thread)

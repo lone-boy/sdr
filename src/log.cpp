@@ -3,7 +3,7 @@
 //
 # include "log.h"
 
-
+using namespace mp;
 void log::output(string text, log_level act_level){
     string prefix;
     if(act_level == debug) prefix = "\033[93m[DEBUG]   ";

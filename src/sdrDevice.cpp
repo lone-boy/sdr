@@ -2,26 +2,30 @@
 // Created by jcc on 22-11-14.
 //
 #include "sdrDevice.h"
-#include "iio.h"
-#include "ad9361.h"
 #include <utility>
 #include "log.h"
 #include "thread"
 #include "functional"
-
+#ifdef IIO
+#include "iio.h"
+#include "ad9361.h"
+#endif
+#ifdef UHD
+#include "uhd/usrp/multi_usrp.hpp"
+#endif
 using namespace mp;
 
 sdrDevice::~sdrDevice() {
     /* NOP */
 }
 
+#ifdef IIO
 class iioDevice :public sdrDevice{
     enum iodev {RX,TX};
-
 public:
     iioDevice(std::string  ip) :
-    _device(std::move(ip))
-    ,_rx(nullptr)
+    _device(std::move(ip)) ,_ctx(nullptr)
+    ,_rx(nullptr),_resize_sample(0)
     ,_rx_buf(nullptr)
     ,_rx0_i(nullptr)
     ,_rx0_q(nullptr)
@@ -64,7 +68,7 @@ public:
     void sdr_set_bandwidth(double bandwidth, int channel) override{
         this->set_ad9361_bd_hz(RX,channel,(long long)bandwidth);
     }
-    void sdr_set_lo_frequency(double frequency, int channel) override{
+    void sdr_set_lo_frequency(double frequency) override{
         this->set_ad9361_lo_hz(RX, (long long) frequency);
     }
     void sdr_set_gain(double gain, int channel) override{
@@ -76,7 +80,7 @@ public:
         set_ad9361_rx_gain_mode(RX,"manual",channel);
         this->sdr_set_bandwidth(2e6,0);
         this->sdr_set_gain(50,0);
-        this->sdr_set_lo_frequency(100.1e6,0);
+        this->sdr_set_lo_frequency(100.1e6);
         this->sdr_set_samplerate(2e6 * 1.25f,0);
         if(not get_ad9361_stream_dev(RX, &_rx))
             this->_log.ERROR("No stream dev ...");
@@ -98,9 +102,10 @@ public:
     }
     void sdr_start_rx(RX_data_callback handler) override{
         _rx_handle = handler;
-        if(!_is_rx_running && !_rx_thread){}
-        _is_rx_running = true;
-        _rx_thread = new std::thread([this] { RXSync_thread(); });
+        if(!_is_rx_running && !_rx_thread){
+            _is_rx_running = true;
+            _rx_thread = new std::thread([this] { RXSync_thread(); });
+        }
     }
     void sdr_stop_rx() override{
         _is_rx_running = false;
@@ -121,10 +126,14 @@ public:
             _rx0_q = nullptr;
         }
     }
+
+    /**
+     * iio sdr
+     * **/
     void RXSync_thread();
 
 private:
-    log _log;
+    mp::log _log;
     string _device;
     /* iio */
     iio_context *_ctx;
@@ -132,7 +141,6 @@ private:
     iio_channel *_rx0_q;
     iio_buffer  *_rx_buf;
     iio_device  *_rx;
-    void *_p_data;
     uint32_t _resize_sample;
     char _tmp_str[64];
     std::thread *_rx_thread;
@@ -156,7 +164,6 @@ private:
     bool set_ad9361_rx_gain_mode(iodev d, const char *mode, int chid);
     bool set_iio_rx_buffer(uint32_t samples_count);
     void enable_iio_channel();
-
 };
 
 bool iioDevice::connect_device(const string &ip) {
@@ -291,7 +298,7 @@ bool iioDevice::set_iio_rx_buffer(uint32_t samples_count) {
     }
     return true;
 }
-
+/* start a new thread */
 void iioDevice::RXSync_thread() {
     _is_rx_buff_resize = false;
     sdr_transfer trans;
@@ -316,65 +323,168 @@ void iioDevice::RXSync_thread() {
     }
     _is_rx_running  = false;
 }
-
+#endif
 
 /**
  * -----------------------------------------------------------------------------------------------------------------
  * UHD INTERFACE
  * -----------------------------------------------------------------------------------------------------------------
  * */
-
+#ifdef UHD
 class uhdDevice : public sdrDevice{
 public:
-    uhdDevice(std::string  ip) :_device(std::move(ip)){}
+    uhdDevice(std::string  ip) :_device(std::move(ip))
+    ,_rx_stream(nullptr)
+    , _stream_args("sc16")
+    ,_buff(0)
+    ,_rx_handle(nullptr)
+    ,_rx_thread(nullptr)
+    ,_is_rx_running(false)
+    {
+
+    }
+    ~uhdDevice(){
+        _rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS);
+    }
     void sdr_open() override{
-        std::cout << "uhd device open" << std::endl;
+        this->_log.INFO("Create UHD device ...");
+        _uhd_device = uhd::usrp::multi_usrp::make(_device);
+
     }
     void sdr_close() override{
-
+        _rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS);
     }
     void sdr_set_samplerate(double sample_rate, int channel) override{
-        std::cout << "uhd device sdr_set_samplerate" << std::endl;
+        _uhd_device->set_rx_rate(sample_rate,channel);
     }
     void sdr_set_gain(double gain, int channel) override{
-        std::cout << "uhd device sdr_set_gain" << std::endl;
+        _uhd_device->set_rx_gain(gain,channel);
     }
     void sdr_set_bandwidth(double bandwidth, int channel) override{
-        std::cout << "uhd device sdr_set_bandwidth" << std::endl;
+        _uhd_device->set_rx_bandwidth(bandwidth,channel);
     }
-    void sdr_set_lo_frequency(double frequency, int channel) override{
-
+    void sdr_set_lo_frequency(double frequency) override{
+        this->_log.DEBUG("Sdr set lo frequency ...");
+        uhd::tune_result_t actual = _uhd_device->set_rx_freq(frequency);
+        string log("Sdr actual get ");
+        log += to_string(actual.actual_rf_freq);
+        this->_log.DEBUG(log);
     }
     bool sdr_check(int channel) override{
+        this->_log.DEBUG("Sdr check ...");
+        std::vector<string> sensor_names;
+        std::string ref;
+        sensor_names = _uhd_device->get_rx_sensor_names(channel);
+        if (std::find(sensor_names.begin(), sensor_names.end(), "lo_locked")
+            != sensor_names.end()) {
+            uhd::sensor_value_t lo_locked = _uhd_device->get_rx_sensor("lo_locked", 0);
+            std::cout << boost::format("Checking RX: %s ...") % lo_locked.to_pp_string()
+                      << std::endl;
+            UHD_ASSERT_THROW(lo_locked.to_bool());
+        }
+        sensor_names = _uhd_device->get_mboard_sensor_names(0);
+        if ((ref == "mimo")
+            and (std::find(sensor_names.begin(), sensor_names.end(), "mimo_locked")
+                 != sensor_names.end())) {
+            uhd::sensor_value_t mimo_locked = _uhd_device->get_mboard_sensor("mimo_locked", 0);
+            std::cout << boost::format("Checking RX: %s ...") % mimo_locked.to_pp_string()
+                      << std::endl;
+            UHD_ASSERT_THROW(mimo_locked.to_bool());
+        }
+        if ((ref == "external")
+            and (std::find(sensor_names.begin(), sensor_names.end(), "ref_locked")
+                 != sensor_names.end())) {
+            uhd::sensor_value_t ref_locked = _uhd_device->get_mboard_sensor("ref_locked", 0);
+            std::cout << boost::format("Checking RX: %s ...") % ref_locked.to_pp_string()
+                      << std::endl;
+            UHD_ASSERT_THROW(ref_locked.to_bool());
+        }
         return true;
     }
     void sdr_set_rx_samplecnt(uint32_t sample_cnt) override{
-
+        _sample_size = sample_cnt;
+        if(not _is_rx_running)
+            _buff.resize(_sample_size*2);
+        else
+            _is_rx_buff_resize = true;
     }
     void sdr_start_rx(RX_data_callback handler) override{
+        _rx_handle = handler;
+
+        _rx_stream = _uhd_device->get_rx_stream(_stream_args);
+        _rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS);
+        if(!_is_rx_running && ! _rx_thread){
+            _is_rx_running = true;
+            _rx_thread = new std::thread([this] { RXSync_thread(); });
+        }
 
     }
     void sdr_set_reset_rx_samplecount(uint32_t sample_cnt) override{
-
+        _sample_size = sample_cnt;
+        _is_rx_buff_resize = true;
     }
     void sdr_stop_rx() override{
-
+        _rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS);
+        if(_rx_thread && _rx_thread->joinable()){
+            _rx_thread->join();
+            delete(_rx_thread);
+        }
+        _is_rx_running = false;
     }
+
+    void RXSync_thread();
 private:
     string _device;
-    double _sample_rate;
-    double _gain;
-    double _band_width;
+    mp::log _log;
+
+    uhd::usrp::multi_usrp::sptr _uhd_device;
+    uhd::stream_args_t _stream_args;
+    uhd::rx_streamer::sptr _rx_stream;
+    std::vector<int16_t> _buff;
+
+    uint32_t _sample_size;
+    RX_data_callback _rx_handle;
+    thread *_rx_thread;
+    bool _is_rx_running,_is_rx_buff_resize;
+
 };
 
+void uhdDevice::RXSync_thread() {
+    _is_rx_buff_resize = false;
+    sdr_transfer trans;
+    uhd::rx_metadata_t md;
+    trans.data = &_buff.front();
+    try {
+        while(_is_rx_running){
+            if(_is_rx_buff_resize){
+                _buff.resize(_sample_size * 2);
+            }
+            int num_rx_samps = _rx_stream->recv(&_buff.front(),_sample_size,md,3.0, false);
+            if(num_rx_samps == _sample_size){
+                trans.length = num_rx_samps;
+            }
+            _rx_handle(&trans);
+        }
+        _rx_stream->issue_stream_cmd(uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS);
+    }
+    catch (std::exception& ex){
+        string log(ex.what());
+        this->_log.ERROR(log);
+    }
+}
 
+#endif
 
 sdrDevice::sdr_sptr sdrDevice::make_sdrDevice(const std::string& driver_type,const std::string& ip) {
+#ifdef UHD
     if(driver_type == "uhd"){
         return sdr_sptr(new uhdDevice(ip));
     }
-    else if(driver_type == "iio"){
+#endif
+#ifdef IIO
+    if(driver_type == "iio"){
         return sdr_sptr (new iioDevice(ip));
     }
+#endif
     return nullptr;
 }
